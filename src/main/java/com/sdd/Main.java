@@ -7,6 +7,7 @@ import java.io.*;
 import java.nio.file.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.sdd.util.PerformanceMonitor;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import me.tongfei.progressbar.ProgressBarStyle;
@@ -30,9 +31,11 @@ public class Main {
 
     // Table configuration
     private Map<String, TableConfig> tableConfigs;
+    static PerformanceMonitor monitor = null;
 
     public static void main(String[] args) {
         Main app = new Main();
+
 
         if(args.length == 0) {
             System.err.println("Usage: java -jar main.jar <config-file>");
@@ -42,6 +45,9 @@ public class Main {
         try {
             String configPath = args[0];
             app.initialize(configPath);
+            // Start performance monitoring
+            monitor = new PerformanceMonitor();
+            monitor.startMonitoring();
             app.performSync();
         } catch (Exception e) {
             System.err.println("Error during synchronization: " + e.getMessage());
@@ -822,6 +828,9 @@ public class Main {
             }
             if (logWriter != null) {
                 logWriter.close();
+            }
+            if (monitor != null) {
+                monitor.stopMonitoring();
             }
         } catch (Exception e) {
             System.err.println("Error during cleanup: " + e.getMessage());
