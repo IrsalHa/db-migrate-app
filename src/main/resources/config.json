@@ -9,7 +9,7 @@
     "username": "ORCLPDB1",
     "password": "ORCLPDB1"
   },
-  "targetBranch": "BRANCH001",
+  "targetBranch": "379",
   "threadPoolSize": 10,
   "batchSize": 5000,
   "tables": [
@@ -32,10 +32,10 @@
       "customQuery": "SELECT * from TORDER"
     },
     {
-      "tableName": "TORDERITEM",
-      "primaryKey": "TORDERITEMPK",
-      "branchField": null,
-      "customQuery": "SELECT * from TORDERITEM"
+      "tableName": "TBRANCHSTOCK",
+      "primaryKey": "TBRANCHSTOCKPK",
+      "branchField": "MBRANCHFK",
+      "customQuery": null
     }
   ]
 }

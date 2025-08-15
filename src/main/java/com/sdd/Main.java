@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import me.tongfei.progressbar.ProgressBarStyle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import me.tongfei.progressbar.ProgressBar;
@@ -91,6 +92,19 @@ public class Main {
         sourceConfig.setIdleTimeout(600000);
         sourceConfig.setMaxLifetime(1800000);
         sourceConfig.setAutoCommit(false);
+        
+        // Performance optimizations
+        sourceConfig.setLeakDetectionThreshold(60000);
+        sourceConfig.addDataSourceProperty("cachePrepStmts", "true");
+        sourceConfig.addDataSourceProperty("prepStmtCacheSize", "250");
+        sourceConfig.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        sourceConfig.addDataSourceProperty("useServerPrepStmts", "true");
+        sourceConfig.addDataSourceProperty("useLocalSessionState", "true");
+        sourceConfig.addDataSourceProperty("rewriteBatchedStatements", "true");
+        sourceConfig.addDataSourceProperty("cacheResultSetMetadata", "true");
+        sourceConfig.addDataSourceProperty("cacheServerConfiguration", "true");
+        sourceConfig.addDataSourceProperty("elideSetAutoCommits", "true");
+        sourceConfig.addDataSourceProperty("maintainTimeStats", "false");
         sourceDataSource = new HikariDataSource(sourceConfig);
 
         // Configure target database connection pool
@@ -105,6 +119,19 @@ public class Main {
         targetConfig.setIdleTimeout(600000);
         targetConfig.setMaxLifetime(1800000);
         targetConfig.setAutoCommit(false);
+        
+        // Performance optimizations
+        targetConfig.setLeakDetectionThreshold(60000);
+        targetConfig.addDataSourceProperty("cachePrepStmts", "true");
+        targetConfig.addDataSourceProperty("prepStmtCacheSize", "250");
+        targetConfig.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        targetConfig.addDataSourceProperty("useServerPrepStmts", "true");
+        targetConfig.addDataSourceProperty("useLocalSessionState", "true");
+        targetConfig.addDataSourceProperty("rewriteBatchedStatements", "true");
+        targetConfig.addDataSourceProperty("cacheResultSetMetadata", "true");
+        targetConfig.addDataSourceProperty("cacheServerConfiguration", "true");
+        targetConfig.addDataSourceProperty("elideSetAutoCommits", "true");
+        targetConfig.addDataSourceProperty("maintainTimeStats", "false");
         targetDataSource = new HikariDataSource(targetConfig);
 
         log("HikariCP connection pools initialized successfully");
@@ -136,8 +163,13 @@ public class Main {
 
         // Count enabled tables for progress tracking
         long enabledTablesCount = config.tables.stream().mapToLong(t -> tableConfigs.containsKey(t.tableName) ? 1 : 0).sum();
-        
-        try (ProgressBar tableProgressBar = new ProgressBar("Syncing Tables", enabledTablesCount)) {
+
+        try (ProgressBar tableProgressBar = ProgressBar.builder()
+                .setTaskName("Syncing Tables")
+                .setInitialMax(enabledTablesCount)
+                .setStyle(ProgressBarStyle.ASCII)
+                .build()) {
+
             for (TableConfigJson tableJson : config.tables) {
                 if (tableConfigs.containsKey(tableJson.tableName)) {
                     TableConfig tableConfig = tableConfigs.get(tableJson.tableName);
@@ -209,7 +241,11 @@ public class Main {
         int threadPoolSize = Math.min(this.config.threadPoolSize, Math.min(totalBatches, 10));
         ExecutorService executor = Executors.newFixedThreadPool(threadPoolSize);
         
-        try (ProgressBar progressBar = new ProgressBar("Processing " + tableName, totalBatches)) {
+        try (ProgressBar progressBar = ProgressBar.builder()
+                .setTaskName("Processing " + tableName)
+                .setInitialMax(totalBatches)
+                .setStyle(ProgressBarStyle.ASCII)
+                .build()) {
             List<Future<SyncResult>> futures = new ArrayList<>();
             
             // Submit batch processing tasks
@@ -331,30 +367,41 @@ public class Main {
                                     List<Map<String, Object>> batch, Connection targetConn) throws SQLException {
         SyncResult result = new SyncResult();
 
-        for (Map<String, Object> record : batch) {
-            try {
-                Object primaryKeyValue = record.get(primaryKey);
-                
-                if (primaryKeyValue == null) {
-                    log("Skipping record in table " + tableName + " with null primary key (" + primaryKey + ")");
-                    result.errors++;
-                    continue;
-                }
-                
-                if (recordExists(tableName, primaryKey, primaryKeyValue, targetConn)) {
-                    updateRecord(tableName, columns, primaryKey, record, targetConn);
-                    result.updated++;
-                } else {
-                    insertRecord(tableName, columns, record, targetConn);
-                    result.inserted++;
-                }
-            } catch (SQLException e) {
-                logError("Error processing record in table " + tableName +
-                        " with " + primaryKey + "=" + record.get(primaryKey) + ": " + e.getMessage());
-                result.errors++;
+        if (batch.isEmpty()) {
+            return result;
+        }
 
-                throw e;
+        // Separate records into insert and update batches based on existence
+        Map<Object, Map<String, Object>> existingRecords = getExistingRecords(tableName, primaryKey, batch, targetConn);
+        
+        List<Map<String, Object>> insertsToProcess = new ArrayList<>();
+        List<Map<String, Object>> updatesToProcess = new ArrayList<>();
+        
+        for (Map<String, Object> record : batch) {
+            Object primaryKeyValue = record.get(primaryKey);
+            if (primaryKeyValue == null) {
+                logError("Skipping record with null primary key in table " + tableName);
+                result.errors++;
+                continue;
             }
+            
+            if (existingRecords.containsKey(primaryKeyValue)) {
+                updatesToProcess.add(record);
+            } else {
+                insertsToProcess.add(record);
+            }
+        }
+        
+        // Process batch inserts
+        if (!insertsToProcess.isEmpty()) {
+            int insertCount = batchInsertRecords(tableName, columns, insertsToProcess, targetConn);
+            result.inserted += insertCount;
+        }
+        
+        // Process batch updates
+        if (!updatesToProcess.isEmpty()) {
+            int updateCount = batchUpdateRecords(tableName, columns, primaryKey, updatesToProcess, targetConn);
+            result.updated += updateCount;
         }
 
         return result;
@@ -443,7 +490,7 @@ public class Main {
                 stmt.setInt(paramIndex++, offset + limit);
                 stmt.setInt(paramIndex, offset);
             } else if (config.branchField != null) {
-                query = "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT * FROM " + tableName + " WHERE " + config.branchField + " = ? ORDER BY " + config.primaryKey + ") a WHERE ROWNUM <= ?) WHERE rnum > ?";
+                query = "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT * FROM " + tableName + " WHERE " + config.branchField + " = ? ORDER BY " + config.primaryKey + ") a WHERE ROWNUM <= ?) WHERE rnum > ? ";
                 stmt = sourceConn.prepareStatement(query);
                 stmt.setString(1, this.config.targetBranch);
                 stmt.setInt(2, offset + limit);
@@ -520,6 +567,53 @@ public class Main {
 
         return exists;
     }
+    
+    private Map<Object, Map<String, Object>> getExistingRecords(String tableName, String primaryKey, 
+                                                                 List<Map<String, Object>> batch, Connection targetConn) throws SQLException {
+        Map<Object, Map<String, Object>> existingRecords = new HashMap<>();
+        
+        if (batch.isEmpty()) {
+            return existingRecords;
+        }
+        
+        // Build IN clause for batch existence check
+        StringBuilder inClause = new StringBuilder();
+        List<Object> primaryKeyValues = new ArrayList<>();
+        
+        for (int i = 0; i < batch.size(); i++) {
+            Map<String, Object> record = batch.get(i);
+            Object pkValue = record.get(primaryKey);
+            if (pkValue != null) {
+                if (inClause.length() > 0) {
+                    inClause.append(", ");
+                }
+                inClause.append("?");
+                primaryKeyValues.add(pkValue);
+            }
+        }
+        
+        if (primaryKeyValues.isEmpty()) {
+            return existingRecords;
+        }
+        
+        String query = "SELECT " + primaryKey + " FROM " + tableName + " WHERE " + primaryKey + " IN (" + inClause + ")";
+        PreparedStatement stmt = targetConn.prepareStatement(query);
+        
+        for (int i = 0; i < primaryKeyValues.size(); i++) {
+            stmt.setObject(i + 1, primaryKeyValues.get(i));
+        }
+        
+        ResultSet rs = stmt.executeQuery();
+        while (rs.next()) {
+            Object pkValue = rs.getObject(1);
+            existingRecords.put(pkValue, new HashMap<>());
+        }
+        
+        rs.close();
+        stmt.close();
+        
+        return existingRecords;
+    }
 
     private void insertRecord(String tableName, List<String> columns, Map<String, Object> record, Connection targetConn) throws SQLException {
         StringBuilder query = new StringBuilder("INSERT INTO " + tableName + " (");
@@ -545,6 +639,58 @@ public class Main {
 
         stmt.executeUpdate();
         stmt.close();
+    }
+    
+    private int batchInsertRecords(String tableName, List<String> columns, List<Map<String, Object>> records, Connection targetConn) throws SQLException {
+        if (records.isEmpty()) {
+            return 0;
+        }
+        
+        StringBuilder query = new StringBuilder("INSERT INTO " + tableName + " (");
+        StringBuilder values = new StringBuilder(" VALUES (");
+
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                query.append(", ");
+                values.append(", ");
+            }
+            query.append(columns.get(i));
+            values.append("?");
+        }
+
+        query.append(")").append(values).append(")");
+        
+        PreparedStatement stmt = targetConn.prepareStatement(query.toString());
+        
+        int batchCount = 0;
+        int totalInserted = 0;
+        
+        for (Map<String, Object> record : records) {
+            for (int i = 0; i < columns.size(); i++) {
+                Object value = record.get(columns.get(i));
+                stmt.setObject(i + 1, value);
+            }
+            stmt.addBatch();
+            batchCount++;
+            
+            // Execute batch every 1000 records to avoid memory issues
+            if (batchCount >= 1000) {
+                int[] results = stmt.executeBatch();
+                totalInserted += results.length;
+                stmt.clearBatch();
+                batchCount = 0;
+            }
+        }
+        
+        // Execute remaining batch
+        if (batchCount > 0) {
+            int[] results = stmt.executeBatch();
+            totalInserted += results.length;
+        }
+        
+        stmt.close();
+        logDebug("Batch inserted " + totalInserted + " records into table " + tableName);
+        return totalInserted;
     }
 
     private void updateRecord(String tableName, List<String> columns, String primaryKey,
@@ -577,6 +723,63 @@ public class Main {
 
         stmt.executeUpdate();
         stmt.close();
+    }
+    
+    private int batchUpdateRecords(String tableName, List<String> columns, String primaryKey, 
+                                   List<Map<String, Object>> records, Connection targetConn) throws SQLException {
+        if (records.isEmpty()) {
+            return 0;
+        }
+        
+        StringBuilder query = new StringBuilder("UPDATE " + tableName + " SET ");
+
+        List<String> updateColumns = new ArrayList<>();
+        for (String column : columns) {
+            if (!column.equalsIgnoreCase(primaryKey)) {
+                updateColumns.add(column);
+            }
+        }
+
+        for (int i = 0; i < updateColumns.size(); i++) {
+            if (i > 0) query.append(", ");
+            query.append(updateColumns.get(i)).append(" = ?");
+        }
+
+        query.append(" WHERE ").append(primaryKey).append(" = ?");
+        
+        PreparedStatement stmt = targetConn.prepareStatement(query.toString());
+        
+        int batchCount = 0;
+        int totalUpdated = 0;
+        
+        for (Map<String, Object> record : records) {
+            int paramIndex = 1;
+            for (String column : updateColumns) {
+                Object value = record.get(column);
+                stmt.setObject(paramIndex++, value);
+            }
+            stmt.setObject(paramIndex, record.get(primaryKey));
+            stmt.addBatch();
+            batchCount++;
+            
+            // Execute batch every 1000 records to avoid memory issues
+            if (batchCount >= 1000) {
+                int[] results = stmt.executeBatch();
+                totalUpdated += results.length;
+                stmt.clearBatch();
+                batchCount = 0;
+            }
+        }
+        
+        // Execute remaining batch
+        if (batchCount > 0) {
+            int[] results = stmt.executeBatch();
+            totalUpdated += results.length;
+        }
+        
+        stmt.close();
+        logDebug("Batch updated " + totalUpdated + " records in table " + tableName);
+        return totalUpdated;
     }
 
     private void log(String message) {
