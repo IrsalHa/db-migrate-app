@@ -10,25 +10,32 @@
     "password": "ORCLPDB1"
   },
   "targetBranch": "BRANCH001",
-  "threadPoolSize": 5,
+  "threadPoolSize": 10,
+  "batchSize": 5000,
   "tables": [
     {
       "tableName": "MCOURIERVENDOR",
       "primaryKey": "MCOURIERVENDORPK",
       "branchField": null,
-      "hasBranchField": false,
-      "customQuery": "SELECT * FROM MCOURIERVENDOR",
-      "enabled": true,
-      "batchSize": 1000
+      "customQuery": "SELECT * FROM MCOURIERVENDOR"
     },
     {
       "tableName": "MCOURIER",
       "primaryKey": "MCOURIERPK",
       "branchField": null,
-      "hasBranchField": false,
-      "customQuery": "SELECT * from MCOURIER",
-      "enabled": true,
-      "batchSize": 1000
+      "customQuery": "SELECT * from MCOURIER"
+    },
+    {
+      "tableName": "TORDER",
+      "primaryKey": "TORDERPK",
+      "branchField": null,
+      "customQuery": "SELECT * from TORDER"
+    },
+    {
+      "tableName": "TORDERITEM",
+      "primaryKey": "TORDERITEMPK",
+      "branchField": null,
+      "customQuery": "SELECT * from TORDERITEM"
     }
   ]
 }

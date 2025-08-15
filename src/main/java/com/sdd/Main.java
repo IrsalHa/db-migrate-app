@@ -12,6 +12,8 @@ import com.zaxxer.hikari.HikariDataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import me.tongfei.progressbar.ProgressBar;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
     private static final Logger logger = LoggerFactory.getLogger(Main.class);
@@ -83,7 +85,7 @@ public class Main {
         sourceConfig.setUsername(config.sourceDb.username);
         sourceConfig.setPassword(config.sourceDb.password);
         sourceConfig.setDriverClassName("oracle.jdbc.driver.OracleDriver");
-        sourceConfig.setMaximumPoolSize(config.threadPoolSize);
+        sourceConfig.setMaximumPoolSize(config.threadPoolSize + 10);
         sourceConfig.setMinimumIdle(2);
         sourceConfig.setConnectionTimeout(30000);
         sourceConfig.setIdleTimeout(600000);
@@ -97,7 +99,7 @@ public class Main {
         targetConfig.setUsername(config.targetDb.username);
         targetConfig.setPassword(config.targetDb.password);
         targetConfig.setDriverClassName("oracle.jdbc.driver.OracleDriver");
-        targetConfig.setMaximumPoolSize(config.threadPoolSize);
+        targetConfig.setMaximumPoolSize(config.threadPoolSize + 10);
         targetConfig.setMinimumIdle(2);
         targetConfig.setConnectionTimeout(30000);
         targetConfig.setIdleTimeout(600000);
@@ -116,15 +118,12 @@ public class Main {
                     tableJson.tableName.toUpperCase(),
                     tableJson.primaryKey.toUpperCase(),
                     tableJson.branchField != null ? tableJson.branchField.toUpperCase() : null,
-                    tableJson.hasBranchField,
-                    tableJson.customQuery,
-                    tableJson.enabled,
-                    tableJson.batchSize != null ? tableJson.batchSize : 1000
+                    tableJson.customQuery
             );
 
-            if (tableConfig.enabled) {
-                tableConfigs.put(tableJson.tableName, tableConfig);
-            }
+
+            tableConfigs.put(tableJson.tableName, tableConfig);
+
         }
     }
 
@@ -136,11 +135,11 @@ public class Main {
         int totalErrors = 0;
 
         // Count enabled tables for progress tracking
-        long enabledTablesCount = config.tables.stream().mapToLong(t -> t.enabled && tableConfigs.containsKey(t.tableName) ? 1 : 0).sum();
+        long enabledTablesCount = config.tables.stream().mapToLong(t -> tableConfigs.containsKey(t.tableName) ? 1 : 0).sum();
         
         try (ProgressBar tableProgressBar = new ProgressBar("Syncing Tables", enabledTablesCount)) {
             for (TableConfigJson tableJson : config.tables) {
-                if (tableJson.enabled && tableConfigs.containsKey(tableJson.tableName)) {
+                if (tableConfigs.containsKey(tableJson.tableName)) {
                     TableConfig tableConfig = tableConfigs.get(tableJson.tableName);
                     
                     try {
@@ -165,67 +164,166 @@ public class Main {
 
     private SyncResult syncTable(String tableName, TableConfig config) {
         SyncResult result = new SyncResult();
-        Connection targetConn = null;
 
         try {
             log("Processing table: " + tableName);
-            targetConn = targetDataSource.getConnection();
 
-            List<Map<String, Object>> sourceData = getSourceData(tableName, config);
-            log("Found " + sourceData.size() + " records in source table " + tableName);
+            int totalCount = getSourceDataCount(tableName, config);
+            log("Found " + totalCount + " records in source table " + tableName);
 
-            if (sourceData.isEmpty()) {
+            if (totalCount == 0) {
                 log("No data found for table " + tableName + " - skipping");
                 return result;
             }
 
-            List<String> columns = getTableColumns(tableName, targetConn);
+            Connection tempConn = targetDataSource.getConnection();
+            List<String> columns = getTableColumns(tableName, tempConn);
+            tempConn.close();
 
-            int batchSize = config.batchSize;
-            int totalBatches = (int) Math.ceil((double) sourceData.size() / batchSize);
+            int batchSize = this.config.batchSize;
+            int totalBatches = (int) Math.ceil((double) totalCount / batchSize);
             
-            try (ProgressBar batchProgressBar = new ProgressBar("Processing " + tableName, totalBatches)) {
-                for (int i = 0; i < sourceData.size(); i += batchSize) {
-                    int endIndex = Math.min(i + batchSize, sourceData.size());
-                    List<Map<String, Object>> batch = sourceData.subList(i, endIndex);
 
-                    SyncResult batchResult = processBatch(tableName, columns, config.primaryKey, batch, targetConn);
-                    result.inserted += batchResult.inserted;
-                    result.updated += batchResult.updated;
-                    result.errors += batchResult.errors;
+            result = processParallel(tableName, config, columns, totalCount, totalBatches);
 
-                    targetConn.commit();
-
-                    log("Processed batch " + (i/batchSize + 1) + " for table " + tableName +
-                            " - Batch size: " + batch.size());
-                    
-                    batchProgressBar.step();
-                }
-            }
 
             log("Successfully processed table " + tableName +
-                    " - Inserted: " + result.inserted + ", Updated: " + result.updated);
+                    " - Inserted: " + result.inserted + ", Updated: " + result.updated + ", Errors: " + result.errors);
 
         } catch (Exception e) {
-            try {
-                if (targetConn != null) {
-                    targetConn.rollback();
-                }
-            } catch (SQLException rollbackEx) {
-                logError("Error during rollback: " + rollbackEx.getMessage());
-            }
             logError("Error processing table " + tableName + ": " + e.getMessage());
             result.errors++;
+        }
+
+        return result;
+    }
+    
+
+    private SyncResult processParallel(String tableName, TableConfig config, List<String> columns, int totalCount, int totalBatches) throws SQLException {
+        SyncResult result = new SyncResult();
+        AtomicInteger totalInserted = new AtomicInteger(0);
+        AtomicInteger totalUpdated = new AtomicInteger(0);
+        AtomicInteger totalErrors = new AtomicInteger(0);
+        
+        // Use thread pool from config, but limit to reasonable number
+        int threadPoolSize = Math.min(this.config.threadPoolSize, Math.min(totalBatches, 10));
+        ExecutorService executor = Executors.newFixedThreadPool(threadPoolSize);
+        
+        try (ProgressBar progressBar = new ProgressBar("Processing " + tableName, totalBatches)) {
+            List<Future<SyncResult>> futures = new ArrayList<>();
+            
+            // Submit batch processing tasks
+            for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                final int offset = batchIndex * this.config.batchSize;
+                final int limit = Math.min(this.config.batchSize, totalCount - offset);
+                
+                Future<SyncResult> future = executor.submit(() -> {
+                    try {
+                        return processBatchParallel(tableName, config, columns, offset, limit);
+                    } catch (Exception e) {
+                        logError("Error in parallel batch processing for table " + tableName + ": " + e.getMessage());
+                        SyncResult errorResult = new SyncResult();
+                        errorResult.errors = 1;
+                        return errorResult;
+                    }
+                });
+                
+                futures.add(future);
+            }
+            
+            // Collect results
+            for (Future<SyncResult> future : futures) {
+                try {
+                    SyncResult batchResult = future.get();
+                    totalInserted.addAndGet(batchResult.inserted);
+                    totalUpdated.addAndGet(batchResult.updated);
+                    totalErrors.addAndGet(batchResult.errors);
+                    progressBar.step();
+                } catch (Exception e) {
+                    logError("Error getting batch result: " + e.getMessage());
+                    totalErrors.incrementAndGet();
+                    progressBar.step();
+                }
+            }
+            
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+        
+        result.inserted = totalInserted.get();
+        result.updated = totalUpdated.get();
+        result.errors = totalErrors.get();
+        
+        return result;
+    }
+    
+    private SyncResult processBatchParallel(String tableName, TableConfig config, List<String> columns, int offset, int limit) throws SQLException {
+        SyncResult result = new SyncResult();
+        Connection targetConn = null;
+        
+        try {
+            // Get data for this specific batch
+            List<Map<String, Object>> batchData = getSourceDataBatch(tableName, config, offset, limit);
+            
+            if (batchData.isEmpty()) {
+                return result;
+            }
+            
+            targetConn = targetDataSource.getConnection();
+            targetConn.setAutoCommit(false);
+            
+            for (Map<String, Object> record : batchData) {
+                try {
+                    Object primaryKeyValue = record.get(config.primaryKey);
+                    if (primaryKeyValue == null) {
+                        logError("Skipping record with null primary key in table " + tableName);
+                        result.errors++;
+                        continue;
+                    }
+                    
+                    if (recordExists(tableName, config.primaryKey, primaryKeyValue, targetConn)) {
+                        updateRecord(tableName, columns, config.primaryKey, record, targetConn);
+                        result.updated++;
+                    } else {
+                        insertRecord(tableName, columns, record, targetConn);
+                        result.inserted++;
+                    }
+                } catch (SQLException e) {
+                    logError("Error processing record in table " + tableName + ": " + e.getMessage());
+                    result.errors++;
+                }
+            }
+            
+            targetConn.commit();
+            logDebug("Completed batch for table " + tableName + " (offset: " + offset + ", limit: " + limit + ") - Inserted: " + result.inserted + ", Updated: " + result.updated + ", Errors: " + result.errors);
+            
+        } catch (Exception e) {
+            if (targetConn != null) {
+                try {
+                    targetConn.rollback();
+                } catch (SQLException rollbackEx) {
+                    logError("Error during rollback in parallel batch: " + rollbackEx.getMessage());
+                }
+            }
+            throw e;
         } finally {
             if (targetConn != null) {
                 try {
                     targetConn.close();
                 } catch (SQLException e) {
-                    logError("Error closing target connection: " + e.getMessage());
+                    logError("Error closing target connection in parallel batch: " + e.getMessage());
                 }
             }
         }
-
+        
         return result;
     }
 
@@ -263,6 +361,65 @@ public class Main {
     }
 
     private List<Map<String, Object>> getSourceData(String tableName, TableConfig config) throws SQLException {
+        // Get total count first
+        int totalCount = getSourceDataCount(tableName, config);
+        log("Total records found for table " + tableName + ": " + totalCount);
+        
+        if (totalCount == 0) {
+            return new ArrayList<>();
+        }
+        
+        // For small datasets, use single-threaded approach
+        if (totalCount <= this.config.batchSize * 2) {
+            return getSourceDataBatch(tableName, config, 0, totalCount);
+        }
+        
+        // For large datasets, we'll return empty list here and handle parallel processing in syncTable
+        return new ArrayList<>();
+    }
+    
+    private int getSourceDataCount(String tableName, TableConfig config) throws SQLException {
+        Connection sourceConn = null;
+        PreparedStatement stmt = null;
+        ResultSet rs = null;
+        
+        try {
+            sourceConn = sourceDataSource.getConnection();
+            String countQuery;
+            
+            if (config.customQuery != null && !config.customQuery.trim().isEmpty()) {
+                // Extract FROM clause from custom query for counting
+                String baseQuery = config.customQuery;
+                if (baseQuery.toUpperCase().contains("ORDER BY")) {
+                    baseQuery = baseQuery.substring(0, baseQuery.toUpperCase().lastIndexOf("ORDER BY"));
+                }
+                countQuery = "SELECT COUNT(*) FROM (" + baseQuery + ")";
+                stmt = sourceConn.prepareStatement(countQuery);
+                if (config.customQuery.contains("?")) {
+                    stmt.setString(1, this.config.targetBranch);
+                }
+            } else if (config.branchField != null) {
+                countQuery = "SELECT COUNT(*) FROM " + tableName + " WHERE " + config.branchField + " = ?";
+                stmt = sourceConn.prepareStatement(countQuery);
+                stmt.setString(1, this.config.targetBranch);
+            } else {
+                countQuery = "SELECT COUNT(*) FROM " + tableName;
+                stmt = sourceConn.prepareStatement(countQuery);
+            }
+            
+            rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+            return 0;
+        } finally {
+            if (rs != null) rs.close();
+            if (stmt != null) stmt.close();
+            if (sourceConn != null) sourceConn.close();
+        }
+    }
+    
+    private List<Map<String, Object>> getSourceDataBatch(String tableName, TableConfig config, int offset, int limit) throws SQLException {
         List<Map<String, Object>> data = new ArrayList<>();
         Connection sourceConn = null;
         PreparedStatement stmt = null;
@@ -273,37 +430,52 @@ public class Main {
             String query;
 
             if (config.customQuery != null && !config.customQuery.trim().isEmpty()) {
-                query = config.customQuery + " ORDER BY " + config.primaryKey;
-                stmt = sourceConn.prepareStatement(query);
-                if (query.contains("?")) {
-                    stmt.setString(1, this.config.targetBranch);
+                String baseQuery = config.customQuery;
+                if (baseQuery.toUpperCase().contains("ORDER BY")) {
+                    baseQuery = baseQuery.substring(0, baseQuery.toUpperCase().lastIndexOf("ORDER BY"));
                 }
-            } else if (config.hasBranchField && config.branchField != null) {
-                query = "SELECT * FROM " + tableName + " WHERE " + config.branchField + " = ?" + " ORDER BY " + config.primaryKey;
+                query = "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (" + baseQuery + " ORDER BY " + config.primaryKey + ") a WHERE ROWNUM <= ?) WHERE rnum > ?";
+                stmt = sourceConn.prepareStatement(query);
+                int paramIndex = 1;
+                if (config.customQuery.contains("?")) {
+                    stmt.setString(paramIndex++, this.config.targetBranch);
+                }
+                stmt.setInt(paramIndex++, offset + limit);
+                stmt.setInt(paramIndex, offset);
+            } else if (config.branchField != null) {
+                query = "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT * FROM " + tableName + " WHERE " + config.branchField + " = ? ORDER BY " + config.primaryKey + ") a WHERE ROWNUM <= ?) WHERE rnum > ?";
                 stmt = sourceConn.prepareStatement(query);
                 stmt.setString(1, this.config.targetBranch);
+                stmt.setInt(2, offset + limit);
+                stmt.setInt(3, offset);
             } else {
-                query = "SELECT * FROM " + tableName + " ORDER BY " + config.primaryKey;
+                query = "SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT * FROM " + tableName + " ORDER BY " + config.primaryKey + ") a WHERE ROWNUM <= ?) WHERE rnum > ?";
                 stmt = sourceConn.prepareStatement(query);
+                stmt.setInt(1, offset + limit);
+                stmt.setInt(2, offset);
             }
 
-            log("Executing query for table " + tableName + ": " + query.substring(0, Math.min(100, query.length())) + "...");
+            logDebug("Executing paginated query for table " + tableName + " (offset: " + offset + ", limit: " + limit + ")");
 
-             stmt.setFetchSize(config.batchSize);
+            // Set fetch size for cursor-based retrieval
+            stmt.setFetchSize(Math.min(1000, limit));
              
-             rs = stmt.executeQuery();
-             ResultSetMetaData metaData = rs.getMetaData();
-             int columnCount = metaData.getColumnCount();
+            rs = stmt.executeQuery();
+            ResultSetMetaData metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
 
-             while (rs.next()) {
-                 Map<String, Object> record = new HashMap<>();
-                 for (int i = 1; i <= columnCount; i++) {
-                     String columnName = metaData.getColumnName(i);
-                     Object value = rs.getObject(i);
-                     record.put(columnName, value);
-                 }
-                 data.add(record);
-             }
+            while (rs.next()) {
+                Map<String, Object> record = new HashMap<>();
+                for (int i = 1; i <= columnCount; i++) {
+                    String columnName = metaData.getColumnName(i);
+                    // Skip the ROWNUM column we added for pagination
+                    if (!"RNUM".equals(columnName.toUpperCase())) {
+                        Object value = rs.getObject(i);
+                        record.put(columnName, value);
+                    }
+                }
+                data.add(record);
+            }
         } finally {
             if (rs != null) rs.close();
             if (stmt != null) stmt.close();
@@ -459,6 +631,7 @@ public class Main {
         public String targetBranch;
         public int threadPoolSize = 5;
         public List<TableConfigJson> tables;
+        public int batchSize = 1000;
     }
 
     public static class DatabaseConnection {
@@ -471,30 +644,21 @@ public class Main {
         public String tableName;
         public String primaryKey;
         public String branchField;
-        public boolean hasBranchField;
         public String customQuery;
-        public boolean enabled = true;
-        public Integer batchSize = 1000;
     }
 
     private static class TableConfig {
         String tableName;
         String primaryKey;
         String branchField;
-        boolean hasBranchField;
         String customQuery;
-        boolean enabled;
-        int batchSize;
 
         public TableConfig(String tableName, String primaryKey, String branchField,
-                           boolean hasBranchField, String customQuery, boolean enabled, int batchSize) {
+                            String customQuery) {
             this.tableName = tableName;
             this.primaryKey = primaryKey;
             this.branchField = branchField;
-            this.hasBranchField = hasBranchField;
             this.customQuery = customQuery;
-            this.enabled = enabled;
-            this.batchSize = batchSize;
         }
     }
 
