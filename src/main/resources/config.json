@@ -1,0 +1,34 @@
+{
+  "sourceDb": {
+    "url": "jdbc:oracle:thin:@//10.12.4.167:1521/XEPDB1",
+    "username": "ORCLPDB1",
+    "password": "ORCLPDB1"
+  },
+  "targetDb": {
+    "url": "jdbc:oracle:thin:@//10.12.4.167:1527/XEPDB1",
+    "username": "ORCLPDB1",
+    "password": "ORCLPDB1"
+  },
+  "targetBranch": "BRANCH001",
+  "threadPoolSize": 5,
+  "tables": [
+    {
+      "tableName": "MCOURIERVENDOR",
+      "primaryKey": "MCOURIERVENDORPK",
+      "branchField": null,
+      "hasBranchField": false,
+      "customQuery": "SELECT * FROM MCOURIERVENDOR",
+      "enabled": true,
+      "batchSize": 1000
+    },
+    {
+      "tableName": "MCOURIER",
+      "primaryKey": "MCOURIERPK",
+      "branchField": null,
+      "hasBranchField": false,
+      "customQuery": "SELECT * from MCOURIER",
+      "enabled": true,
+      "batchSize": 1000
+    }
+  ]
+}
